@@ -43,7 +43,11 @@ def load_sent():
         return set()
 
     try:
-        data = json.loads(SENT_FILE.read_text(encoding="utf-8"))
+        content = SENT_FILE.read_text(encoding="utf-8").strip()
+        if not content:
+            return set()
+        
+        data = json.loads(content)
         if isinstance(data, list):
             return set(str(x) for x in data)
         if isinstance(data, dict):
@@ -55,7 +59,6 @@ def load_sent():
 
 
 def save_sent(sent):
-    # Keep newest-ish IDs without letting the file grow forever.
     values = list(sent)[-MAX_SENT:]
     SENT_FILE.write_text(
         json.dumps(values, indent=2, ensure_ascii=False),
@@ -64,8 +67,6 @@ def save_sent(sent):
 
 
 def make_id(post):
-    # Prefer a direct PDF/page link. Fall back to the post's
-    # identifying fields so the same post is not resent.
     identity = "|".join([
         post.get("url", ""),
         post.get("title", ""),
@@ -89,88 +90,71 @@ def fetch_page():
     return r.text
 
 
-def likely_post_link(a):
-    href = (a.get("href") or "").strip()
-    text = clean(a.get_text(" ", strip=True))
-
-    if not href or href.lower().startswith(("javascript:", "#", "mailto:")):
-        return False
-
-    h = href.lower()
-    # SCS analyst reports commonly expose PDFs/audio/report links.
-    return (
-        ".pdf" in h
-        or "apaudio" in h
-        or "analyst" in h
-        or "opinion" in h
-        or len(text) > 12
-    )
-
-
 def extract_posts(html):
     soup = BeautifulSoup(html, "html.parser")
     posts = []
 
-    # Strategy 1: detect links around analyst-report content.
-    for a in soup.find_all("a", href=True):
-        title = clean(a.get_text(" ", strip=True))
-        href = urljoin(BASE_URL, a["href"])
+    # Scope strictly to the ASP.NET GridView container
+    grid = soup.select_one("#ContentPlaceHolder1_GridView1")
+    if not grid:
+        logging.warning("GridView container (#ContentPlaceHolder1_GridView1) not found.")
+        return []
 
-        if not likely_post_link(a):
+    # Iterate over individual post tables within the grid
+    tables = grid.select("table.sTable")
+    if not tables:
+        # Fallback if class names vary slightly but nested tables exist
+        tables = grid.find_all("table")
+
+    for tbl in tables:
+        cells = tbl.find_all("td")
+        if not cells:
             continue
 
-        parent = a.parent
-        context = clean(parent.get_text(" ", strip=True)) if parent else title
+        company, title, analyst_raw, date_raw, content_raw = "", "", "", "", ""
+        pdf_url = ""
 
-        # Skip obvious navigation/footer links.
-        if any(x in title.lower() for x in [
-            "contact us", "privacy policy", "disclaimer",
-            "home", "login", "register", "about us",
-        ]):
-            continue
+        # Strategy A: Precise grid layout extraction (5-cell structure)
+        if len(cells) >= 4:
+            company = clean(cells[0].get_text(" ", strip=True))
+            title = clean(cells[1].get_text(" ", strip=True))
+            
+            meta_text = clean(cells[2].get_text(" ", strip=True))
+            content_raw = clean(cells[3].get_text(" ", strip=True)) if len(cells) > 3 else ""
 
-        if len(title) < 8:
+            # Extract Analyst name and Date/Time from metadata cell
+            analyst_match = re.search(r"(?:Analyst|By)\s*[:\-]?\s*([^0-9\n|•]+)", meta_text, re.I)
+            if analyst_match:
+                analyst_raw = clean(analyst_match.group(1))
+
+            date_match = re.search(
+                r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},\s+\d{4}"
+                r"(?:\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?)?",
+                meta_text,
+                re.I,
+            )
+            if date_match:
+                date_raw = clean(date_match.group(0))
+
+        # Look for the explicit PDF/Audio link inside the table
+        pdf_anchor = tbl.find("a", href=re.compile(r"(\.pdf|AnalystOpinionPdf|apaudio)", re.I))
+        if pdf_anchor and pdf_anchor.get("href"):
+            pdf_url = urljoin(BASE_URL, pdf_anchor["href"].strip())
+
+        # Validation: Ignore empty or header rows
+        if not title or len(title) < 4:
             continue
 
         posts.append({
+            "company": company[:150],
             "title": title[:300],
-            "url": href,
-            "context": context[:1800],
-            "company": "",
-            "analyst": "",
-            "date": "",
-            "content": "",
+            "analyst": analyst_raw[:100],
+            "date": date_raw,
+            "context": content_raw[:1800],
+            "url": pdf_url or SOURCE_URL,
         })
 
-    # Strategy 2: if the page exposes headings/table rows, capture them.
-    for row in soup.find_all(["tr", "article", "li", "div"]):
-        txt = clean(row.get_text(" ", strip=True))
-        low = txt.lower()
-
-        if not txt or len(txt) < 20 or len(txt) > 2500:
-            continue
-
-        if not any(k in low for k in ["analyst", "opinion", "research", "report"]):
-            continue
-
-        links = row.find_all("a", href=True)
-        if not links:
-            continue
-
-        for a in links:
-            title = clean(a.get_text(" ", strip=True))
-            if len(title) >= 8:
-                posts.append({
-                    "title": title[:300],
-                    "url": urljoin(BASE_URL, a["href"]),
-                    "context": txt[:1800],
-                    "company": "",
-                    "analyst": "",
-                    "date": "",
-                    "content": "",
-                })
-
-    # Deduplicate candidate records.
+    # Deduplicate candidate records
     unique = {}
     for p in posts:
         key = (p["url"], p["title"])
@@ -179,44 +163,19 @@ def extract_posts(html):
     return list(unique.values())
 
 
-def enrich(post):
-    text = post.get("context", "")
-
-    # Conservative extraction. We don't invent fields when the site
-    # doesn't expose them in a predictable pattern.
-    date_match = re.search(
-        r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},\s+\d{4}"
-        r"(?:\s+\d{1,2}:\d{2}\s*(?:AM|PM)?)?",
-        text,
-        re.I,
-    )
-    if date_match:
-        post["date"] = clean(date_match.group(0))
-
-    analyst_match = re.search(
-        r"(?:Analyst|By|Author)\s*[:\-]\s*([^|•]+)",
-        text,
-        re.I,
-    )
-    if analyst_match:
-        post["analyst"] = clean(analyst_match.group(1))[:120]
-
-    return post
-
-
 def send_discord(post):
     if not DISCORD_WEBHOOK_URL:
         raise RuntimeError("DISCORD_WEBHOOK_URL is not configured.")
 
     title = post["title"]
-    url = post["url"] or SOURCE_URL
+    url = post["url"]
     description = post.get("context", "")
 
     if len(description) > 850:
         description = description[:847] + "..."
 
     embed = {
-        "title": "📢 New SCS Analyst Opinion",
+        "title": "📢 NEW SCS ANALYST OPINION",
         "description": f"**{title}**",
         "url": url,
         "color": 3447003,
@@ -227,35 +186,36 @@ def send_discord(post):
 
     if post.get("company"):
         embed["fields"].append({
-            "name": "Company / Index",
+            "name": "🏢 Company / Index",
             "value": post["company"][:1024],
             "inline": True,
         })
 
     if post.get("analyst"):
         embed["fields"].append({
-            "name": "Analyst",
+            "name": "👤 Analyst",
             "value": post["analyst"][:1024],
             "inline": True,
         })
 
     if post.get("date"):
         embed["fields"].append({
-            "name": "Date",
+            "name": "🕐 Date",
             "value": post["date"][:1024],
             "inline": True,
         })
 
-    if description and description != title:
+    if description and description.lower() != title.lower():
         embed["fields"].append({
-            "name": "Details",
+            "name": "📝 Details",
             "value": description,
             "inline": False,
         })
 
+    pdf_label = "📄 Open PDF Report" if ".pdf" in url.lower() or "pdf" in url.lower() else "🔗 View Source Report"
     embed["fields"].append({
-        "name": "Source",
-        "value": f"[Open Analyst Opinions]({SOURCE_URL})",
+        "name": "Source Link",
+        "value": f"[{pdf_label}]({url})",
         "inline": False,
     })
 
@@ -282,21 +242,19 @@ def main():
     logging.info("Checking SCS Analyst Opinions: %s", SOURCE_URL)
 
     html = fetch_page()
-    posts = [enrich(p) for p in extract_posts(html)]
+    posts = extract_posts(html)
 
     if not posts:
-        raise RuntimeError(
-            "No analyst posts were detected. The SCS page structure may have changed."
-        )
+        logging.warning("No analyst posts detected. Check if table layout or grid ID changed.")
+        return
 
-    logging.info("Detected %d candidate post(s).", len(posts))
+    logging.info("Detected %d candidate analyst post(s).", len(posts))
 
-    # The page normally puts newest content first. Keep only a manageable
-    # number of candidates per run.
     posts = posts[:MAX_POSTS_PER_RUN]
 
     sent = load_sent()
-    first_run = not SENT_FILE.exists()
+    # Treat uninitialized/empty state as first-run seeding
+    first_run = (not SENT_FILE.exists()) or (len(sent) == 0)
     new_posts = []
 
     for post in reversed(posts):
@@ -305,7 +263,6 @@ def main():
         if post_id in sent:
             continue
 
-        # On the first run, seed existing records instead of flooding Discord.
         if first_run and not SEND_EXISTING_ON_FIRST_RUN:
             sent.add(post_id)
             continue
@@ -324,7 +281,7 @@ def main():
         send_discord(post)
         sent.add(post_id)
         save_sent(sent)
-        logging.info("Sent: %s", post["title"])
+        logging.info("Sent alert: %s", post["title"])
 
     if not new_posts:
         save_sent(sent)
